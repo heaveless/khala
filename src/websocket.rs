@@ -5,16 +5,15 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::audio::{mono_to_channels, resample};
+use crate::audio;
+use crate::metrics::{self, PipelineMetrics};
 use crate::protocol::ServerEvent;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-pub async fn connect(api_key: &str) -> Result<WsStream> {
-    let url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
-
-    let request = http::Request::builder()
+pub async fn connect(api_key: &str, url: &str) -> Result<WsStream> {
+    let req = http::Request::builder()
         .uri(url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("OpenAI-Beta", "realtime=v1")
@@ -22,71 +21,80 @@ pub async fn connect(api_key: &str) -> Result<WsStream> {
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tungstenite::handshake::client::generate_key(),
-        )
+        .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
         .body(())?;
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(request).await?;
-    Ok(ws_stream)
+    let (stream, _) = tokio_tungstenite::connect_async(req).await?;
+    Ok(stream)
 }
 
-pub async fn recv_loop(
-    mut ws_stream: futures_util::stream::SplitStream<WsStream>,
-    playback_buffer: Arc<Mutex<VecDeque<i16>>>,
-    output_sample_rate: u32,
-    output_channels: u16,
+pub async fn receive(
+    mut stream: futures_util::stream::SplitStream<WsStream>,
+    buffer: Arc<Mutex<VecDeque<i16>>>,
+    sample_rate: u32,
+    channels: u16,
+    api_rate: u32,
+    m: Arc<PipelineMetrics>,
 ) -> Result<()> {
-    while let Some(msg) = ws_stream.next().await {
-        let msg = msg?;
-        let text = match msg {
+    while let Some(msg) = stream.next().await {
+        let text = match msg? {
             Message::Text(t) => t,
             Message::Close(_) => {
-                println!("WebSocket closed by server.");
+                m.push_log("Connection closed.".into());
+                m.set_status("Disconnected".into());
                 break;
             }
             _ => continue,
         };
 
-        let event: ServerEvent = match serde_json::from_str(&text) {
-            Ok(e) => e,
-            Err(err) => {
-                eprintln!("Failed to parse server event: {err}");
-                continue;
+        match serde_json::from_str::<ServerEvent>(&text) {
+            Ok(ServerEvent::SessionCreated {}) => {
+                m.push_log("Session created.".into());
+                m.set_status("Connected".into());
             }
-        };
-
-        match event {
-            ServerEvent::SessionCreated { .. } => {
-                println!("Session created.");
+            Ok(ServerEvent::SessionUpdated {}) => {
+                m.push_log("Session configured.".into());
+                m.set_status("Listening...".into());
             }
-            ServerEvent::SessionUpdated { .. } => {
-                println!("Session configured. Speak into the microphone!");
+            Ok(ServerEvent::AudioDelta { delta }) => {
+                decode_audio(&delta, &buffer, api_rate, sample_rate, channels, &m)?;
             }
-            ServerEvent::ResponseAudioDelta { delta, .. } => {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(&delta)?;
-                let samples: Vec<i16> = bytes
-                    .chunks_exact(2)
-                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-                    .collect();
-
-                let resampled = resample(&samples, 24000, output_sample_rate);
-                let expanded = mono_to_channels(&resampled, output_channels);
-
-                let mut buf = playback_buffer.lock().unwrap();
-                buf.extend(expanded);
-            }
-            ServerEvent::ResponseAudioDone { .. } => {}
-            ServerEvent::Error { error } => {
-                eprintln!(
-                    "API Error: {:?} - {}",
+            Ok(ServerEvent::Error { error }) => {
+                let msg = format!(
+                    "API error: {:?} - {}",
                     error.code,
                     error.message.unwrap_or_default()
                 );
+                m.push_log(msg);
             }
-            _ => {}
+            Ok(_) => {}
+            Err(e) => m.push_log(format!("Parse error: {e}")),
         }
     }
+    Ok(())
+}
+
+fn decode_audio(
+    b64: &str,
+    buffer: &Arc<Mutex<VecDeque<i16>>>,
+    from_rate: u32,
+    to_rate: u32,
+    channels: u16,
+    m: &Arc<PipelineMetrics>,
+) -> Result<()> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+    let samples: Vec<i16> = bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    m.add_received(samples.len() as u64, bytes.len() as u64);
+    let rms = metrics::compute_rms(&samples);
+    m.push_output_history(rms as f64);
+
+    let resampled = audio::resample(&samples, from_rate, to_rate);
+    let expanded = audio::expand_channels(&resampled, channels);
+
+    buffer.lock().unwrap().extend(expanded);
     Ok(())
 }

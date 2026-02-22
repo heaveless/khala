@@ -1,108 +1,60 @@
 mod audio;
+mod config;
+mod metrics;
+mod pipeline;
 mod protocol;
+mod ui;
 mod websocket;
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
-
-use protocol::{ClientEvent, SessionConfig, TurnDetection};
+use std::sync::Arc;
+use config::Config;
+use metrics::PipelineMetrics;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
+    let cfg = Arc::new(Config::from_env()?);
 
-    println!("Connecting to OpenAI Realtime API...");
+    let fwd_metrics = Arc::new(PipelineMetrics::new());
+    let rev_metrics = Arc::new(PipelineMetrics::new());
 
-    let ws_stream = websocket::connect(&api_key).await?;
-    let (ws_sink, ws_recv) = ws_stream.split();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<String>(64);
+    let fwd_label = format!("{} → {}", cfg.source_lang, cfg.target_lang);
+    let rev_label = format!("{} → {}", cfg.target_lang, cfg.source_lang);
 
-    // Send session configuration: server VAD with eager detection
-    let session_update = ClientEvent::SessionUpdate {
-        session: SessionConfig {
-            modalities: vec!["text".into(), "audio".into()],
-            instructions: "You are a voice transformation assistant. \
-                Repeat back exactly what the user says, but in a different voice. \
-                Do not add commentary, do not interpret, just echo the exact words \
-                spoken by the user. Speak naturally and clearly."
-                .into(),
-            voice: "echo".into(),
-            input_audio_format: "pcm16".into(),
-            output_audio_format: "pcm16".into(),
-            turn_detection: Some(TurnDetection {
-                detection_type: "server_vad".into(),
-                threshold: Some(0.5),
-                silence_duration_ms: Some(300),
-                prefix_padding_ms: Some(200),
-            }),
-        },
-    };
-    outgoing_tx
-        .send(serde_json::to_string(&session_update)?)
-        .await?;
-
-    // Set up audio I/O
-    let (mic_tx, mic_rx) = mpsc::channel::<Vec<i16>>(16);
-    let playback_buffer = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-
-    let (_capture, input_config) = audio::start_capture(mic_tx)?;
-    let (_playback, output_config) = audio::start_playback(playback_buffer.clone())?;
-
-    println!(
-        "Audio devices initialized.\n  Input:  {}Hz, {} ch\n  Output: {}Hz, {} ch",
-        input_config.sample_rate.0,
-        input_config.channels,
-        output_config.sample_rate.0,
-        output_config.channels
+    let forward = pipeline::run(
+        &cfg,
+        cfg.mic_device.as_deref(),
+        Some(&cfg.virtual_output_device),
+        cfg.forward_instruction(),
+        fwd_label.clone(),
+        fwd_metrics.clone(),
     );
 
-    // Task: mic audio -> outgoing JSON events (streams continuously, no muting)
-    let input_rate = input_config.sample_rate.0;
-    let input_channels = input_config.channels;
-    let outgoing_tx_mic = outgoing_tx.clone();
-    let mic_task = tokio::spawn(async move {
-        audio::mic_to_events(mic_rx, outgoing_tx_mic, input_rate, input_channels).await
-    });
+    let reverse = pipeline::run(
+        &cfg,
+        Some(&cfg.virtual_input_device),
+        cfg.speaker_device.as_deref(),
+        cfg.reverse_instruction(),
+        rev_label.clone(),
+        rev_metrics.clone(),
+    );
 
-    // Task: outgoing channel -> WebSocket
-    let ws_send_task = tokio::spawn(async move {
-        let mut sink = ws_sink;
-        use futures_util::SinkExt;
-        while let Some(json) = outgoing_rx.recv().await {
-            if let Err(e) = sink.send(tungstenite::Message::Text(json.into())).await {
-                eprintln!("WebSocket send error: {e}");
-                break;
-            }
-        }
-    });
+    let app = ui::AppState {
+        config: cfg.clone(),
+        forward: fwd_metrics,
+        reverse: rev_metrics,
+        forward_label: fwd_label,
+        reverse_label: rev_label,
+    };
 
-    // Task: WebSocket -> playback buffer
-    let output_rate = output_config.sample_rate.0;
-    let output_channels = output_config.channels;
-    let ws_recv_task = tokio::spawn(async move {
-        websocket::recv_loop(ws_recv, playback_buffer, output_rate, output_channels).await
-    });
-
-    println!("Ready! Speak into your microphone. Press Ctrl+C to exit.");
+    let tui = ui::run(app, shutdown_tx);
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down...");
-        }
-        result = mic_task => {
-            eprintln!("Mic task ended: {result:?}");
-        }
-        result = ws_send_task => {
-            eprintln!("WS send task ended: {result:?}");
-        }
-        result = ws_recv_task => {
-            eprintln!("WS recv task ended: {result:?}");
-        }
+        _ = shutdown_rx.changed() => {}
+        r = forward => { if let Err(e) = r { eprintln!("Forward error: {e}"); } }
+        r = reverse => { if let Err(e) = r { eprintln!("Reverse error: {e}"); } }
+        r = tui     => { if let Err(e) = r { eprintln!("TUI error: {e}"); } }
     }
 
     Ok(())

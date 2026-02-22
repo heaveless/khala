@@ -1,15 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-// --- Client Events (sent to OpenAI) ---
-
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub enum ClientEvent {
     #[serde(rename = "session.update")]
     SessionUpdate { session: SessionConfig },
-
     #[serde(rename = "input_audio_buffer.append")]
-    InputAudioBufferAppend { audio: String },
+    AppendAudio { audio: String },
 }
 
 #[derive(Serialize)]
@@ -35,43 +32,24 @@ pub struct TurnDetection {
     pub prefix_padding_ms: Option<u32>,
 }
 
-// --- Server Events (received from OpenAI) ---
-
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerEvent {
     #[serde(rename = "session.created")]
     SessionCreated {},
-
     #[serde(rename = "session.updated")]
     SessionUpdated {},
-
     #[serde(rename = "response.audio.delta")]
-    ResponseAudioDelta { delta: String },
-
+    AudioDelta { delta: String },
     #[serde(rename = "response.audio.done")]
-    ResponseAudioDone {},
-
-    #[serde(rename = "response.done")]
-    ResponseDone {},
-
+    AudioDone {},
     #[serde(rename = "error")]
     Error { error: ApiError },
-
-    #[serde(rename = "input_audio_buffer.speech_started")]
-    SpeechStarted {},
-
-    #[serde(rename = "input_audio_buffer.speech_stopped")]
-    SpeechStopped {},
-
-    #[serde(rename = "input_audio_buffer.committed")]
-    InputAudioBufferCommitted {},
-
     #[serde(other)]
-    Unknown,
+    Other,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct ApiError {
     pub code: Option<String>,
     pub message: Option<String>,
