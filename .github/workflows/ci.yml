@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings

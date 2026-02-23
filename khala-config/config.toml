@@ -1,0 +1,43 @@
+# Khala Translator Configuration
+
+[openai]
+# api_key = ""  # Prefer OPENAI_API_KEY env var
+model = "gpt-realtime-mini"
+voice = "cedar"
+temperature = 0.4  # 0.0-1.0 (lower = more deterministic)
+
+[translation]
+source_lang = "Spanish"
+target_lang = "English"
+
+[audio]
+format = "pcm16"
+noise_reduction = "near_field"  # "near_field" (headset), "far_field" (laptop mic), or omit to disable
+sample_rate = 24000
+# mic_device = ""       # Omit for system default
+# speaker_device = ""   # Omit for system default
+
+[devices]
+virtual_output = "BlackHole 2ch"
+virtual_input = "BlackHole 16ch"
+
+[vad]
+threshold = 0.5
+silence_ms = 150
+prefix_ms = 200
+min_speech_ms = 150
+
+[rvc]
+enabled = false
+lib = ""  # Path to RVC-WebUI codebase (required if enabled)
+model = "{config_dir}/rvc/model.pth"
+index = "{config_dir}/rvc/model.index"
+hubert = "{config_dir}/rvc/hubert_base.pt"
+rmvpe = "{config_dir}/rvc/rmvpe.pt"
+socket = "{data_dir}/rvc.sock"
+f0method = "rmvpe"
+pitch = 0
+index_rate = 0.3
+block_time = 0.1
+extra_time = 2.5
+crossfade_time = 0.05

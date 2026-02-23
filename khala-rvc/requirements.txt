@@ -1,0 +1,7 @@
+torch
+torchaudio
+faiss-cpu
+numpy
+scipy
+librosa
+fairseq @ git+https://github.com/facebookresearch/fairseq.git

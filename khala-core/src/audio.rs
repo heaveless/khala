@@ -13,8 +13,6 @@ pub struct AudioHandle {
     _stream: Stream,
 }
 
-// --- Device discovery ---
-
 pub fn find_input(name: Option<&str>) -> Result<Device> {
     let host = cpal::default_host();
     find_device(name, host.input_devices()?, host.default_input_device(), "Input")
@@ -32,26 +30,18 @@ fn find_device(
     direction: &str,
 ) -> Result<Device> {
     match name {
-        Some(query) => {
-            for device in devices {
-                if let Ok(n) = device.name() {
-                    if n.contains(query) {
-                        return Ok(device);
-                    }
-                }
-            }
-            anyhow::bail!("{direction} device '{query}' not found")
-        }
+        Some(query) => devices
+            .filter_map(|d| d.name().ok().filter(|n| n.contains(query)).map(|_| d))
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{direction} device '{query}' not found")),
         None => default.ok_or_else(|| anyhow::anyhow!("No default {direction} device")),
     }
 }
 
-// --- Stream creation ---
-
 pub fn start_capture(
     device: &Device,
-    tx: mpsc::Sender<Vec<i16>>,
-    m: Arc<PipelineMetrics>,
+    sender: mpsc::Sender<Vec<i16>>,
+    metrics: Arc<PipelineMetrics>,
 ) -> Result<(AudioHandle, StreamConfig)> {
     let supported = device.default_input_config()?;
     let format = supported.sample_format();
@@ -61,20 +51,23 @@ pub fn start_capture(
         SampleFormat::I16 => device.build_input_stream(
             &config,
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                m.set_input_level(metrics::compute_rms(data), metrics::compute_peak(data));
-                let _ = tx.try_send(data.to_vec());
+                metrics.set_input_level(metrics::compute_rms(data), metrics::compute_peak(data));
+                let _ = sender.try_send(data.to_vec());
             },
             |e| eprintln!("Input error: {e}"),
             None,
         )?,
         SampleFormat::F32 => {
-            let m = m.clone();
+            let metrics = metrics.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let pcm: Vec<i16> = data.iter().map(|&s| (s * 32767.0) as i16).collect();
-                    m.set_input_level(metrics::compute_rms(&pcm), metrics::compute_peak(&pcm));
-                    let _ = tx.try_send(pcm);
+                    metrics.set_input_level(
+                        metrics::compute_rms(&pcm),
+                        metrics::compute_peak(&pcm),
+                    );
+                    let _ = sender.try_send(pcm);
                 },
                 |e| eprintln!("Input error: {e}"),
                 None,
@@ -90,7 +83,7 @@ pub fn start_capture(
 pub fn start_playback(
     device: &Device,
     buffer: Arc<Mutex<VecDeque<i16>>>,
-    m: Arc<PipelineMetrics>,
+    metrics: Arc<PipelineMetrics>,
 ) -> Result<(AudioHandle, StreamConfig)> {
     let supported = device.default_output_config()?;
     let format = supported.sample_format();
@@ -102,32 +95,38 @@ pub fn start_playback(
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                 {
                     let mut buf = buffer.lock().unwrap();
-                    for s in data.iter_mut() {
-                        *s = buf.pop_front().unwrap_or(0);
+                    for sample in data.iter_mut() {
+                        *sample = buf.pop_front().unwrap_or(0);
                     }
-                    m.set_buffer_depth(buf.len());
+                    metrics.set_buffer_depth(buf.len());
                 }
-                m.set_output_level(metrics::compute_rms(data), metrics::compute_peak(data));
+                metrics.set_output_level(
+                    metrics::compute_rms(data),
+                    metrics::compute_peak(data),
+                );
             },
             |e| eprintln!("Output error: {e}"),
             None,
         )?,
         SampleFormat::F32 => {
-            let m = m.clone();
+            let metrics = metrics.clone();
             device.build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut pcm = vec![0i16; data.len()];
                     {
                         let mut buf = buffer.lock().unwrap();
-                        for (i, s) in data.iter_mut().enumerate() {
+                        for (i, out) in data.iter_mut().enumerate() {
                             let sample = buf.pop_front().unwrap_or(0);
                             pcm[i] = sample;
-                            *s = sample as f32 / 32767.0;
+                            *out = sample as f32 / 32767.0;
                         }
-                        m.set_buffer_depth(buf.len());
+                        metrics.set_buffer_depth(buf.len());
                     }
-                    m.set_output_level(metrics::compute_rms(&pcm), metrics::compute_peak(&pcm));
+                    metrics.set_output_level(
+                        metrics::compute_rms(&pcm),
+                        metrics::compute_peak(&pcm),
+                    );
                 },
                 |e| eprintln!("Output error: {e}"),
                 None,
@@ -140,24 +139,22 @@ pub fn start_playback(
     Ok((AudioHandle { _stream: stream }, config))
 }
 
-// --- Audio encoding pipeline ---
-
 pub async fn encode_and_send(
     mut rx: mpsc::Receiver<Vec<i16>>,
     tx: mpsc::Sender<String>,
     sample_rate: u32,
     channels: u16,
     api_rate: u32,
-    m: Arc<PipelineMetrics>,
+    metrics: Arc<PipelineMetrics>,
 ) -> Result<()> {
     while let Some(raw) = rx.recv().await {
         let mono = to_mono(&raw, channels);
         let resampled = resample(&mono, sample_rate, api_rate);
 
-        let rms = metrics::compute_rms(&resampled);
-        m.push_input_history(rms as f64);
+        metrics.push_input_history(metrics::compute_rms(&resampled) as f64);
+
         let bytes: Vec<u8> = resampled.iter().flat_map(|s| s.to_le_bytes()).collect();
-        m.add_sent(resampled.len() as u64, bytes.len() as u64);
+        metrics.add_sent(resampled.len() as u64, bytes.len() as u64);
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let json = serde_json::to_string(&ClientEvent::AppendAudio { audio: b64 })?;
@@ -165,8 +162,6 @@ pub async fn encode_and_send(
     }
     Ok(())
 }
-
-// --- DSP helpers ---
 
 pub fn to_mono(input: &[i16], channels: u16) -> Vec<i16> {
     if channels == 1 {

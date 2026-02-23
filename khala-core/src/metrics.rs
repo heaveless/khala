@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
-const HISTORY_LEN: usize = 60;
+const HISTORY_LEN: usize = 200;
 const LOG_CAPACITY: usize = 20;
+const TRANSCRIPT_CAPACITY: usize = 50;
 
 pub struct PipelineMetrics {
     pub input_rms: AtomicU32,
@@ -19,6 +20,10 @@ pub struct PipelineMetrics {
     pub output_history: Mutex<VecDeque<f64>>,
     pub status: Mutex<String>,
     pub log: Mutex<VecDeque<String>>,
+    pub transcript: Mutex<VecDeque<String>>,
+    pub text_only: bool,
+    pub is_draft: AtomicBool,
+    pub speech_active: AtomicBool,
 }
 
 pub struct Snapshot {
@@ -33,10 +38,13 @@ pub struct Snapshot {
     pub output_history: Vec<u64>,
     pub status: String,
     pub log: Vec<String>,
+    pub transcript: Vec<String>,
+    pub text_only: bool,
+    pub is_draft: bool,
 }
 
 impl PipelineMetrics {
-    pub fn new() -> Self {
+    pub fn new(text_only: bool) -> Self {
         Self {
             input_rms: AtomicU32::new(0),
             output_rms: AtomicU32::new(0),
@@ -51,6 +59,10 @@ impl PipelineMetrics {
             output_history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
             status: Mutex::new("Initializing...".into()),
             log: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
+            transcript: Mutex::new(VecDeque::with_capacity(TRANSCRIPT_CAPACITY)),
+            text_only,
+            is_draft: AtomicBool::new(false),
+            speech_active: AtomicBool::new(false),
         }
     }
 
@@ -59,7 +71,7 @@ impl PipelineMetrics {
             hist.lock()
                 .unwrap()
                 .iter()
-                .map(|&v| (v * 100.0).min(100.0) as u64)
+                .map(|&v| (v.sqrt() * 100.0).min(100.0) as u64)
                 .collect()
         };
 
@@ -75,6 +87,9 @@ impl PipelineMetrics {
             output_history: scale(&self.output_history),
             status: self.status.lock().unwrap().clone(),
             log: self.log.lock().unwrap().iter().cloned().collect(),
+            transcript: self.transcript.lock().unwrap().iter().cloned().collect(),
+            text_only: self.text_only,
+            is_draft: self.is_draft.load(Relaxed),
         }
     }
 
@@ -124,6 +139,76 @@ impl PipelineMetrics {
             log.pop_front();
         }
         log.push_back(msg);
+    }
+
+    pub fn push_transcript_delta(&self, delta: &str) {
+        let mut t = self.transcript.lock().unwrap();
+        if let Some(last) = t.back_mut() {
+            last.push_str(delta);
+        } else {
+            t.push_back(delta.to_string());
+        }
+        self.is_draft.store(true, Relaxed);
+    }
+
+    /// Replace the current (last) transcript entry with new text.
+    /// Used when a new speculative response starts — swaps old draft for new in one step.
+    pub fn replace_current_transcript(&self, text: &str) {
+        let mut t = self.transcript.lock().unwrap();
+        if let Some(last) = t.back_mut() {
+            last.clear();
+            last.push_str(text);
+        } else {
+            t.push_back(text.to_string());
+        }
+        self.is_draft.store(true, Relaxed);
+    }
+
+    pub fn current_draft_len(&self) -> usize {
+        self.transcript.lock().unwrap().back().map_or(0, |s| s.len())
+    }
+
+    /// Prepare for a new subtitle — pushes a new empty entry so deltas start fresh.
+    /// The old text remains visible (renderer picks last non-empty) until new text arrives.
+    pub fn start_new_subtitle(&self) {
+        let mut t = self.transcript.lock().unwrap();
+        if t.len() >= TRANSCRIPT_CAPACITY {
+            t.pop_front();
+        }
+        t.push_back(String::new());
+        self.is_draft.store(true, Relaxed);
+    }
+
+    pub fn finish_transcript(&self) {
+        if self.text_only {
+            // Subtitle mode: mark as final, keep text visible until next speech starts.
+            self.is_draft.store(false, Relaxed);
+        } else {
+            let mut t = self.transcript.lock().unwrap();
+            if t.len() >= TRANSCRIPT_CAPACITY {
+                t.pop_front();
+            }
+            t.push_back(String::new());
+            self.is_draft.store(false, Relaxed);
+        }
+    }
+}
+
+impl Default for PipelineMetrics {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+// --- Speech state ---
+
+impl PipelineMetrics {
+    pub fn set_speech_active(&self, active: bool) {
+        self.speech_active.store(active, Relaxed);
+    }
+
+    pub fn is_speech_active(&self) -> bool {
+        self.speech_active.load(Relaxed)
     }
 }
 

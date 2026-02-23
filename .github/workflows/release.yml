@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Rename binary
+        run: mv target/release/khala khala-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: khala-${{ matrix.target }}
+          path: khala-${{ matrix.target }}
+
+  package-rvc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package khala-rvc
+        run: tar -czf khala-rvc.tar.gz -C khala-rvc .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: khala-rvc
+          path: khala-rvc.tar.gz
+
+  release:
+    needs: [build, package-rvc]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/khala-aarch64-apple-darwin/khala-aarch64-apple-darwin
+            artifacts/khala-x86_64-apple-darwin/khala-x86_64-apple-darwin
+            artifacts/khala-rvc/khala-rvc.tar.gz
+            install.sh
